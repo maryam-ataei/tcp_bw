@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * TCP CUBIC: Binary Increase Congestion control for TCP v2.3
  * Home page:
@@ -39,8 +40,8 @@
 
 /* Number of delay samples for detecting the increase of delay */
 #define HYSTART_MIN_SAMPLES	8
-#define HYSTART_DELAY_MIN	(4U<<3)
-#define HYSTART_DELAY_MAX	(16U<<3)
+#define HYSTART_DELAY_MIN	(4000U)	/* 4 ms */
+#define HYSTART_DELAY_MAX	(16000U)	/* 16 ms */
 #define HYSTART_DELAY_THRESH(x)	clamp(x, HYSTART_DELAY_MIN, HYSTART_DELAY_MAX)
 
 static int fast_convergence __read_mostly = 1;
@@ -52,7 +53,8 @@ static int tcp_friendliness __read_mostly = 1;
 static int hystart __read_mostly = 1;
 static int hystart_detect __read_mostly = HYSTART_ACK_TRAIN | HYSTART_DELAY;
 static int hystart_low_window __read_mostly = 16;
-static int hystart_ack_delta __read_mostly = 2;
+static int hystart_ack_delta_us __read_mostly = 2000;
+
 static u32 cube_rtt_scale __read_mostly;
 static u32 beta_scale __read_mostly;
 static u64 cube_factor __read_mostly;
@@ -75,10 +77,8 @@ MODULE_PARM_DESC(hystart_detect, "hybrid slow start detection mechanisms"
 		 " 1: packet-train 2: delay 3: both packet-train and delay");
 module_param(hystart_low_window, int, 0644);
 MODULE_PARM_DESC(hystart_low_window, "lower bound cwnd for hybrid slow start");
-module_param(hystart_ack_delta, int, 0644);
-MODULE_PARM_DESC(hystart_ack_delta, "spacing between ack's indicating train (msecs)");
-
-
+module_param(hystart_ack_delta_us, int, 0644);
+MODULE_PARM_DESC(hystart_ack_delta_us, "spacing between ack's indicating train (usecs)");
 
 /* BIC TCP Parameters */
 struct bictcp {
@@ -89,7 +89,7 @@ struct bictcp {
 	u32	bic_origin_point;/* origin point of bic function */
 	u32	bic_K;		/* time to origin point
 				   from the beginning of the current epoch */
-	u32	delay_min;	/* min delay (msec << 3) */
+	u32	delay_min;	/* min delay (usec) */
 	u32	epoch_start;	/* beginning of an epoch */
 	u32	ack_cnt;	/* number of acks */
 	u32	tcp_cwnd;	/* estimated tcp cwnd */
@@ -97,15 +97,17 @@ struct bictcp {
 	u8	sample_cnt;	/* number of samples to decide curr_rtt */
 	u8	found;		/* the exit point is found? */
 	u32	round_start;	/* beginning of each round */
-    	u32	last_round_start;                                                        //change
 	u32	end_seq;	/* end_seq of the round */
 	u32	last_ack;	/* last time when the ACK spacing is close */
 	u32	curr_rtt;	/* the minimum rtt of current round */
-	u8	est_round_cnt;                                                        //change
-	u32	bandwidth_est_median;                                                        //change
-	u32	previous_ack_byte;
-	u32	PRE_ACKED_BYTES;
-	u32	current_ack_byte;
+    // CCRG
+	u32	flow_start;       /* start time of flow (easier logs) */
+	u8	rtt_round;	  /* rtt round (1, 2, ...) */
+	u32	prev_round_start; /* previous rtt round start time */
+	u32	prev_bytes_acked; /* previous total bytes acked */
+	u16	array[320];		/*array of bandwidth for round 1 to 5 */
+	u8 	counter;		/*The index of array's elements */
+	u8 	print;			/*flag for print array */
 };
 
 static inline void bictcp_reset(struct bictcp *ca)
@@ -121,21 +123,19 @@ static inline void bictcp_reset(struct bictcp *ca)
 	ca->ack_cnt = 0;
 	ca->tcp_cwnd = 0;
 	ca->found = 0;
-	ca->bandwidth_est_median = 0;                                                        //change
-	ca->last_round_start = 0;                                                        //change
-	ca->est_round_cnt = 0;                                                        //change
-	ca->previous_ack_byte = 0;
-	ca->PRE_ACKED_BYTES = 0;
-	ca->current_ack_byte = 0;
+
+	// CCRG
+	ca->rtt_round = 0;
+	ca->prev_round_start = 0;
+	ca->prev_bytes_acked = 0;
+	ca->flow_start = 0;
+	ca->counter = 0;
+	ca->print = 0;
 }
 
-static inline u32 bictcp_clock(void)
+static inline u32 bictcp_clock_us(const struct sock *sk)
 {
-#if HZ < 1000
-	return ktime_to_ms(ktime_get_real());
-#else
-	return jiffies_to_msecs(jiffies);
-#endif
+	return tcp_sk(sk)->tcp_mstamp;
 }
 
 static inline void bictcp_hystart_reset(struct sock *sk)
@@ -143,9 +143,9 @@ static inline void bictcp_hystart_reset(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bictcp *ca = inet_csk_ca(sk);
 
-	ca->round_start = ca->last_ack = bictcp_clock();
+	ca->round_start = ca->last_ack = bictcp_clock_us(sk);
 	ca->end_seq = tp->snd_nxt;
-	ca->curr_rtt = 0;
+	ca->curr_rtt = ~0U;
 	ca->sample_cnt = 0;
 }
 
@@ -288,7 +288,7 @@ static inline void bictcp_update(struct bictcp *ca, u32 cwnd, u32 acked)
 	 */
 
 	t = (s32)(tcp_jiffies32 - ca->epoch_start);
-	t += msecs_to_jiffies(ca->delay_min >> 3);
+	t += usecs_to_jiffies(ca->delay_min);
 	/* change the unit from HZ to bictcp_HZ */
 	t <<= BICTCP_HZ;
 	do_div(t, HZ);
@@ -388,143 +388,215 @@ static void bictcp_state(struct sock *sk, u8 new_state)
 	}
 }
 
-static void insertSorted(int arr[], int n, int key, int capacity)
+/* Account for TSO/GRO delays.
+ * Otherwise short RTT flows could get too small ssthresh, since during
+ * slow start we begin with small TSO packets and ca->delay_min wouldI
+ * not account for long aggregation delay when TSO packets get bigger.
+ * Ideally even with a very small RTT we would like to have at least one
+ * TSO packet being sent and received by GRO, and another one in qdisc layer.
+ * We apply another 100% factor because @rate is doubled at this point.
+ * We cap the cushion to 1ms.
+ */
+static u32 hystart_ack_delay(struct sock *sk)
 {
-	if (n >= capacity)
-		return;
+	unsigned long rate;
 
+	rate = READ_ONCE(sk->sk_pacing_rate);
+	if (!rate)
+		return 0;
+	return min_t(u64, USEC_PER_MSEC,
+		     div64_ul((u64)GSO_MAX_SIZE * 4 * USEC_PER_SEC, rate));
+}
+
+//////////////////////////////////////////////////
+	// CCRG
+static void insertSorted(struct bictcp *ca, u16 newvalue) 
+{
+	//struct bictcp *ca = inet_csk_ca(sk);
 	int i;
-	for (i = n-1; (i>= 0 && arr[i] > key); i--)
-		arr[i+1] = arr[i];
-	arr[i+1] = key;
+	u8 n=0;
+	n = ca->counter;
 
-	int p = arr[i+1];
-	int q = arr[i];
 
-	 //printk(KERN_INFO "[CUBIC] key %u, i %d, n %d, arr[i] %u , arr[i+1] %u \n", key, i, n, q, p);
+	if (n >= 320) {
+		 printk(KERN_INFO "[CCRG]: The array is full\n");
+		 return;
+	}
+
+	for (i = n-1; (i>= 0 && ca->array[i] > newvalue); i--) {
+		ca->array[i+1] = ca->array[i];
+		//printk(KERN_INFO "[CCRG]: array %u \n", ca->array[i+1]);
+	}
+	ca->array[i+1] = newvalue;
+
+	//printk(KERN_INFO "[CCRG]: array %u \n", ca->array[i+1]);
+
+}
+
+static void printArray(struct bictcp *ca)
+{
+	//struct bictcp *ca = inet_csk_ca(sk);
+	int j;
+	u8 index=0;
+	int n=0;
+	n = ca->counter;
+
+	printk(KERN_INFO "[CCRG]: array :[");
+	for (j=0; j<=n-1; j++) {
+		printk(KERN_CONT "%u ", ca->array[j]);
+	}	
+	printk(KERN_CONT "]\n");
+	
+	//Find the median of the array elements
+	if (n % 2 == 0) {
+		index = n / 2;
+	
+	} else {
+		index = (n-1)/2;
+	}	
+	printk(KERN_INFO "[CCRG]: Fifty percent of bandwidth[%u]: %u\n", index, ca->array[index]);
 	
 }
+// 
+	//////////////////////////////////////////////////
+
+
 
 static void hystart_update(struct sock *sk, u32 delay)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bictcp *ca = inet_csk_ca(sk);
-	u32 threshold;
-	static u64 bitrate = 0;
-	//static u32 Last_est_Round = 0;
-	 //static u32 SEND_Cwnd = 0;
-	 //static u32 CURRENT_RTT = 0;
-	static u32 SUM_ACKEDBYTES = 0;
-	 //static u32 sum_of_B_acked = 0;
-	static int n = 0;
-	
-	
+	u32 threshold;;
 
-	int port;
+	//////////////////////////////////////////////////
+	// CCRG
+	u32 pp_time_us;
+	u32 acked_bytes;
+	u16 bw_est_mbps;
+	int port;	
 	uint16_t b0, b1;
 	b0 = (tp->inet_conn.icsk_inet.inet_sport & 0x00ff) << 8u;
 	b1 = (tp->inet_conn.icsk_inet.inet_sport & 0xff00) >> 8u;
 	port = b0 | b1;
-	
 
-	if (ca->found & hystart_detect) {
-		return;
-	}
+	/* Only compute for iperf data.*/
+	if (port == 5201) {
 
-    //start change:
+	  u32 now_us = bictcp_clock_us(sk);
+
+	  /* Note flow start time for easier to read times in log. */
+	  if (ca->flow_start == 0) {
+	    printk(KERN_INFO "[CCRG] hystart_update(): new flow start at %u\n",
+		   now_us);
+	    ca->flow_start = now_us;
+	  }
+
+	  /* Update RTT round. */
+	  if (ca->prev_round_start != ca->round_start) {
+		  ca->rtt_round++;
+		  ca->prev_round_start = ca->round_start;
+		  ca->print = 1;
+	  }
+
+	  /* Compute packet pair bandwidth estimate. */
+	  pp_time_us = now_us - ca->last_ack;
+	  acked_bytes = tp->bytes_acked - ca->prev_bytes_acked;
+	  bw_est_mbps = 0;
+	  if (pp_time_us > 0) {
+	  	bw_est_mbps = acked_bytes * 8 / pp_time_us;
+	  }
+	    
+
+
+	  /* Write to log. */
+	  printk(KERN_INFO "[CCRG] rtt_round %u [bytes_acked %llu, prev_bytes_acked %u, acked_bytes %u] [now_us %u, last_ack %u, pp_time_us %u]  [bw_est %u Mb/s]\n",
+		 ca->rtt_round,
+		 tp->bytes_acked, ca->prev_bytes_acked, acked_bytes,
+		 (now_us - ca->flow_start),
+		 (ca->last_ack - ca->flow_start), pp_time_us,
+		 bw_est_mbps
+		 );
+
+
+	  //Insert estimated bandwidth in a sorted array for round trip time 1 to 5
+	 
+	  if (ca->rtt_round >= 2 && ca->rtt_round <= 6){
+	  	insertSorted(ca, bw_est_mbps);
+	  	++ca->counter;
+	  	
+	  }
+
+	  //Print the cumulative array after end of each array and find the median of the array
+	  if (ca->rtt_round == 3 || ca->rtt_round == 4 || ca->rtt_round == 5 || ca->rtt_round == 6 || ca->rtt_round == 7){
+	  	if (ca->print == 1) {			
+	  		printArray(ca);
+	  	 	ca->print =0; 
+	  	}
+	  }
+	  	
+
+	  /* Update variables for next time. */
+	  ca->prev_bytes_acked = tp->bytes_acked;
+	  ca->last_ack = now_us;
+
+	  return;
+
+	} // 
+	//////////////////////////////////////////////////
+
 	if (hystart_detect & HYSTART_ACK_TRAIN) {
-		u32 now = bictcp_clock();
-		u32 packet_pair_time;
-        	u32 sum_of_B_acked; 
-        	
-		
-		ca->current_ack_byte = tp->bytes_acked;
+		u32 now = bictcp_clock_us(sk);
 
-		if (port == 5201)
-		{
-			if (ca->last_round_start != ca->round_start)
-			{
-				ca->est_round_cnt++;
-				ca->last_round_start = ca->round_start;
-				
+		/* first detection parameter - ack-train detection */
+		if ((s32)(now - ca->last_ack) <= hystart_ack_delta_us) {
+			ca->last_ack = now;
+
+			threshold = ca->delay_min + hystart_ack_delay(sk);
+
+			/* Hystart ack train triggers if we get ack past
+			 * ca->delay_min/2.
+			 * Pacing might have delayed packets up to RTT/2
+			 * during slow start.
+			 */
+			if (sk->sk_pacing_status == SK_PACING_NONE)
+				threshold >>= 1;
+
+			if ((s32)(now - ca->round_start) > threshold) {
+				ca->found = 1;
+				pr_debug("hystart_ack_train (%u > %u) delay_min %u (+ ack_delay %u) cwnd %u\n",
+					 now - ca->round_start, threshold,
+					 ca->delay_min, hystart_ack_delay(sk), tp->snd_cwnd);
+				NET_INC_STATS(sock_net(sk),
+					      LINUX_MIB_TCPHYSTARTTRAINDETECT);
+				NET_ADD_STATS(sock_net(sk),
+					      LINUX_MIB_TCPHYSTARTTRAINCWND,
+					      tp->snd_cwnd);
+				tp->snd_ssthresh = tp->snd_cwnd;
 			}
-
-			if (ca->curr_rtt == 0 || ca->curr_rtt > delay) 
-			{
-				ca->curr_rtt = delay;
-			}
-
-
-			 //SEND_Cwnd = tp->snd_cwnd;
-			 //CURRENT_RTT = ca->curr_rtt;
-			bitrate = tp->snd_cwnd * 1448 * 8 / ca->curr_rtt;
-
-			 //Last_est_Round = ca->est_round_cnt;
-
-			printk(KERN_INFO "[CUBIC] CURRENT BITRATE %u Mb/s, CURRENT LAST ROUND COUNT %u \n", bitrate, ca->est_round_cnt);
-
-			// packet pair bandwidth estimation
-			if (ca->est_round_cnt <= 5)
-			{
-				packet_pair_time = (now - ca->last_ack) * 1000;
-
-				sum_of_B_acked = ca->current_ack_byte - ca->previous_ack_byte;
-
-				printk(KERN_INFO "[CUBIC] current acked byte %u Bytes, previous acked byte %u Bytes, and sum of acked bytes %u Bytes, and pakt pair_time %u usec \n",ca->current_ack_byte, ca->previous_ack_byte, sum_of_B_acked, packet_pair_time);
-
-				ca->previous_ack_byte = tp->bytes_acked;
-
-
-				printk(KERN_INFO "[CUBIC] PKT PAIR TIME %u us, LAST ACK %u us, NOW %u us \n", packet_pair_time, ca->last_ack, now);
-
-				if (packet_pair_time > 0)
-				{
-
-					
-					ca->last_ack = now;		
-
-					SUM_ACKEDBYTES = ca->current_ack_byte - ca->PRE_ACKED_BYTES;
-
-					printk(KERN_INFO "[CUBIC] CURRENT_ACKED_BYTES %u Bytes, PREVIOUS_ACKED_BYTES %u Bytes, SUM_ACKED_BYTES %u Bytes, and PACKETPAIR_TIME %u us \n", ca->current_ack_byte, ca->PRE_ACKED_BYTES, SUM_ACKEDBYTES, packet_pair_time);
-
-					ca->PRE_ACKED_BYTES = tp->bytes_acked;
-
-					u32 est_packet_pair_bd = (sum_of_B_acked * 8 ) / packet_pair_time;
-					u32 ES_PKT_PAIRBD = (SUM_ACKEDBYTES * 8) / packet_pair_time;
-					n = n+1;
-
-					
-					
-					printk(KERN_INFO "[CUBIC] Round %u, Packet pair time %u us, Est. bandwidth %u Mb/s, sum of acked bytes: %u Bytes \n", ca->est_round_cnt, packet_pair_time, est_packet_pair_bd, sum_of_B_acked);
-					printk(KERN_INFO "[CUBIC] Round %u, Packet pair time %u us, Calculated_BANDWIDTH(packettime is zero,not change) %u Mb/s, sum of acked bytes: %u Bytes \n", ca->est_round_cnt, packet_pair_time, ES_PKT_PAIRBD, SUM_ACKEDBYTES);
-
-					int arr[320];
-
-					int capacity = sizeof(arr) / sizeof(arr[0]);
-
-					u32 key;
-
-					key = est_packet_pair_bd;
-
-					insertSorted(arr, n, key, capacity);
-
-					
-					
-				}
-				else{
-						printk(KERN_INFO "[CUBIC]  Round %u, Ignore sample as packet-pair time is:: %u us\n", ca->est_round_cnt, packet_pair_time);
-
-				}
-			}
-			printk(KERN_INFO "[CUBIC] Round %u, sending cwnd %u, RTT %u, bitrate %llu Mb/s \n", ca->est_round_cnt, tp->snd_cwnd, ca->curr_rtt, bitrate);
 		}
 	}
 
+	if (hystart_detect & HYSTART_DELAY) {
+		/* obtain the minimum delay of more than sampling packets */
+		if (ca->curr_rtt > delay)
+			ca->curr_rtt = delay;
+		if (ca->sample_cnt < HYSTART_MIN_SAMPLES) {
+			ca->sample_cnt++;
+		} else {
+			if (ca->curr_rtt > ca->delay_min +
+			    HYSTART_DELAY_THRESH(ca->delay_min >> 3)) {
+				ca->found = 1;
+				NET_INC_STATS(sock_net(sk),
+					      LINUX_MIB_TCPHYSTARTDELAYDETECT);
+				NET_ADD_STATS(sock_net(sk),
+					      LINUX_MIB_TCPHYSTARTDELAYCWND,
+					      tp->snd_cwnd);
+				tp->snd_ssthresh = tp->snd_cwnd;
+			}
+		}
+	}
 }
 
-/* Track delayed acknowledgment ratio using sliding window
- * ratio = (15*ratio + sample) / 16
- */
 static void bictcp_acked(struct sock *sk, const struct ack_sample *sample)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
@@ -539,7 +611,7 @@ static void bictcp_acked(struct sock *sk, const struct ack_sample *sample)
 	if (ca->epoch_start && (s32)(tcp_jiffies32 - ca->epoch_start) < HZ)
 		return;
 
-	delay = (sample->rtt_us << 3) / USEC_PER_MSEC;
+	delay = sample->rtt_us;
 	if (delay == 0)
 		delay = 1;
 
@@ -548,7 +620,7 @@ static void bictcp_acked(struct sock *sk, const struct ack_sample *sample)
 		ca->delay_min = delay;
 
 	/* hystart triggers when cwnd is larger than some threshold */
-	if (hystart && tcp_in_slow_start(tp) &&
+	if (!ca->found && tcp_in_slow_start(tp) && hystart &&
 	    tp->snd_cwnd >= hystart_low_window)
 		hystart_update(sk, delay);
 }
@@ -560,7 +632,7 @@ static struct tcp_congestion_ops cubictcp __read_mostly = {
 	.set_state	= bictcp_state,
 	.undo_cwnd	= tcp_reno_undo_cwnd,
 	.cwnd_event	= bictcp_cwnd_event,
-	.pkts_acked     = bictcp_acked,
+	.pkts_acked = bictcp_acked,
 	.owner		= THIS_MODULE,
 	.name		= "cubic",
 };
