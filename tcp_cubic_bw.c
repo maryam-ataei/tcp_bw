@@ -427,7 +427,7 @@ static u32 hystart_ack_delay(struct sock *sk)
 		     div64_ul((u64)GSO_MAX_SIZE * 4 * USEC_PER_SEC, rate));
 }
 
-//////////////////////////////////////////////////
+///////////////////////////////////////////////
 	// CCRG
 static inline void print_header(struct bictcp *ca)
 {
