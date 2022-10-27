@@ -77,6 +77,3 @@ See also `bin/` directory for utilities.
 
 ----------------
 
-Happy slow-starting!
-
--- Mark
